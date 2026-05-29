@@ -1,0 +1,13 @@
+# Pure RLVR preset — spec §4.4 / D-1.
+#
+# DeepSeek-R1-style: only the verifiable terminal signal matters; all
+# shaping / rubric / TIR channels are disabled. One-flag flip from the
+# composite default. Useful for ablations isolating the terminal-only
+# learning curve, and as the simplest possible reward surface for
+# unfamiliar trainer integrations.
+
+preset: pure_rlvr
+alpha: 0.0     # shaping disabled
+beta:  0.0     # rubric disabled
+lambda: 2.0    # unused while alpha=0; kept consistent for schema parity
+gamma: 0.0     # TIR disabled

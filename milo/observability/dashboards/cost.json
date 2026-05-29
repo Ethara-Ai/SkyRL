@@ -1,0 +1,29 @@
+{
+  "_dashboard_id": "milo_cost",
+  "title": "Milo — Cost Tracking",
+  "audience": "ops / finance",
+  "sections": [
+    {
+      "name": "Per-run cost envelope",
+      "panels": [
+        { "type": "line",   "metric": "cost/cumulative_usd",         "title": "Cumulative spend ($)" },
+        { "type": "scalar", "metric": "cost/hard_kill_threshold_usd","title": "Hard kill ($200K — plan §25)" }
+      ]
+    },
+    {
+      "name": "Bedrock judge usage",
+      "panels": [
+        { "type": "line", "metric": "judge/cumulative_calls" },
+        { "type": "line", "metric": "judge/cumulative_cost_usd" },
+        { "type": "line", "metric": "judge/cache_hit_rate" }
+      ]
+    },
+    {
+      "name": "Storage",
+      "panels": [
+        { "type": "line", "metric": "storage/checkpoint_gb" },
+        { "type": "line", "metric": "storage/log_gb" }
+      ]
+    }
+  ]
+}

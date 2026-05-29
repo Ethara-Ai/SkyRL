@@ -1,0 +1,46 @@
+# Phase 18.3 — Milo trainer Docker image (FSDP + Megatron capable).
+# Used by Slurm and K8s training jobs.
+
+FROM nvidia/cuda:12.4.0-cudnn-devel-ubuntu22.04 AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_PROGRESS_BAR=off
+ENV NCCL_DEBUG=INFO
+ENV CUDA_LAUNCH_BLOCKING=0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git python3.12 python3.12-venv python3-pip \
+      build-essential cmake ninja-build patch openssh-client \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+ && mv /root/.local/bin/uv /usr/local/bin/uv
+
+WORKDIR /workspace/SkyRL
+COPY pyproject.toml uv.lock README.md ./
+COPY skyrl/        skyrl/
+COPY skyrl-agent/  skyrl-agent/
+COPY skyrl-gym/    skyrl-gym/
+COPY skyrl-train/  skyrl-train/
+COPY skyrl-tx/     skyrl-tx/
+COPY examples/     examples/
+COPY milo/         milo/
+COPY docker/       docker/
+COPY .python-version ./
+
+# fsdp + miniswe extras for the RL run; mutually-exclusive megatron extra is
+# layered separately for the megatron-backend variant.
+RUN uv sync --frozen --extra fsdp --extra miniswe --extra dev || \
+    uv sync --extra fsdp --extra miniswe --extra dev
+
+# Defaults — every value is overridable at runtime.
+ENV MILO_BASE_MODEL="Qwen/Qwen2.5-Coder-32B-Instruct"
+ENV MILO_BETA_KL_INITIAL="0.01"
+ENV MILO_BETA_KL_FINAL="0.005"
+ENV MILO_BETA_KL_ANNEAL_STEPS="4800"
+ENV MILO_JUDGE_MODEL="claude-opus-4-6"
+ENV MILO_POLICY_METHOD="lora"
+ENV EVAL_DOCKER_IMAGE_PREFIX="426628337772.dkr.ecr.ap-south-1.amazonaws.com/rfp-coding-q1"
+
+CMD ["bash"]

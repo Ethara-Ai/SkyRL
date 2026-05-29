@@ -1,0 +1,91 @@
+# Phase 10 — Milo CI.
+# Runs on every PR touching milo/** and on push to milo branches.
+# Three jobs: lint+typecheck, fast tests, then heavier integration (CPU only).
+
+name: milo-ci
+
+on:
+  pull_request:
+    paths:
+      - "milo/**"
+      - "Dockerfile.milo-*"
+      - ".github/workflows/milo-ci.yml"
+  push:
+    branches:
+      - "milo/**"
+      - "main"
+    paths:
+      - "milo/**"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Sync dev extras
+        run: uv sync --extra dev
+      - name: ruff
+        run: uv run ruff check milo/
+      - name: mypy
+        run: uv run mypy milo/ --ignore-missing-imports
+
+  fast-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Sync
+        run: uv sync --extra dev
+      - name: Run milo unit tests (CPU-only)
+        run: |
+          uv run pytest milo/ -x -v \
+            --ignore=milo/lht_adapter/tests/test_env.py \
+            --ignore=milo/verifier/tests/test_three_run.py
+      - name: Property test — reward aggregator (plan §6.1)
+        run: uv run pytest milo/reward/tests/test_composite.py -x -v
+
+  smoke-no-gpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: fast-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Sync
+        run: uv sync --extra dev
+      - name: Audit script smoke
+        run: |
+          uv run python -m milo.audit.audit_dataset \
+            --milo-dataset-dir milo/data/audit_v1_fixtures || true
+      - name: Spike preprocess smoke (uses included sample)
+        run: |
+          if [[ -f milo/data/spike_v1_fixtures/locustio__locust-1541.jsonl ]]; then
+            uv run python -m milo.spike.preprocess_one_milo \
+              --milo-jsonl milo/data/spike_v1_fixtures/locustio__locust-1541.jsonl \
+              --output-dir /tmp/spike_ci
+          fi
+
+  replay-golden-traces:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: fast-tests
+    if: false   # Enabled once milo/data/golden_traces/ is populated (Phase 11.11)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Replay 10% of golden traces
+        run: |
+          uv run python -m milo.replay.cli --golden --sample-pct 10

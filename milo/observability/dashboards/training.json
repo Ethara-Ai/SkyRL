@@ -1,0 +1,30 @@
+{
+  "_dashboard_id": "milo_training",
+  "title": "Milo — Training Internals",
+  "audience": "RL engineer",
+  "sections": [
+    {
+      "name": "GRPO components (spec §20.2)",
+      "panels": [
+        { "type": "line", "metric": "train/loss_pg",              "title": "PG loss" },
+        { "type": "line", "metric": "train/loss_kl",              "title": "KL loss" },
+        { "type": "line", "metric": "train/loss_total",           "title": "Total loss" },
+        { "type": "line", "metric": "train/beta_kl",              "title": "β_KL (annealed, v0.7: 0.01 → 0.005)" },
+        { "type": "line", "metric": "train/ratio_mean",           "title": "Ratio mean" },
+        { "type": "line", "metric": "train/ratio_max",            "title": "Ratio max" },
+        { "type": "line", "metric": "train/advantage_mean",       "title": "Advantage mean" },
+        { "type": "line", "metric": "train/advantage_std",        "title": "Advantage std" },
+        { "type": "line", "metric": "train/kl_mean",              "title": "KL mean" },
+        { "type": "line", "metric": "train/grad_norm_pre_clip",   "title": "Grad norm pre-clip" },
+        { "type": "line", "metric": "train/grad_norm_post_clip",  "title": "Grad norm post-clip" }
+      ]
+    },
+    {
+      "name": "Throughput",
+      "panels": [
+        { "type": "line", "metric": "train/tokens_per_sec" },
+        { "type": "line", "metric": "train/samples_per_sec" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "_dashboard_id": "milo_health",
+  "title": "Milo — Reference Run Health",
+  "audience": "on-call",
+  "sections": [
+    {
+      "name": "Headline (4 charts the on-call watches daily)",
+      "panels": [
+        { "type": "line",    "metric": "eval/pass_at_8_overall",     "title": "pass@8 (holdout)" },
+        { "type": "line",    "metric": "train/loss_total",           "title": "Total loss" },
+        { "type": "line",    "metric": "train/loss_kl",              "title": "KL loss" },
+        { "type": "line",    "metric": "train/grad_norm_post_clip",  "title": "Grad norm (post-clip)" }
+      ]
+    },
+    {
+      "name": "Reward decomposition",
+      "panels": [
+        { "type": "line", "metric": "rollout/mean_r_total",    "title": "R_total" },
+        { "type": "line", "metric": "rollout/mean_r_terminal", "title": "R_terminal" },
+        { "type": "line", "metric": "rollout/mean_r_rubric",   "title": "R_rubric (mean)" }
+      ]
+    },
+    {
+      "name": "Alarms",
+      "panels": [
+        { "type": "scalar", "metric": "alarm/image_pull_failure_rate" },
+        { "type": "scalar", "metric": "alarm/invariant_violation_rate" },
+        { "type": "scalar", "metric": "alarm/bedrock_429_count" }
+      ]
+    }
+  ]
+}
