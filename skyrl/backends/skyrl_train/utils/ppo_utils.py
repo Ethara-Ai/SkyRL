@@ -405,6 +405,7 @@ class BaseFunctionRegistry:
 class AdvantageEstimator(StrEnum):
     GAE = "gae"
     GRPO = "grpo"
+    GTPO = "gtpo"
     RLOO = "rloo"
     REINFORCE_PP = "reinforce++"
     MAXRL = "maxrl"
@@ -435,6 +436,7 @@ class AdvantageEstimatorRegistry(BaseFunctionRegistry):
             "rloo": [AdvantageEstimator.RLOO, compute_rloo_outcome_advantage],
             "reinforce++": [AdvantageEstimator.REINFORCE_PP, compute_reinforce_plus_plus_outcome_advantage],
             "maxrl": [AdvantageEstimator.MAXRL, compute_maxrl_advantage],
+            "gtpo": [AdvantageEstimator.GTPO, compute_gtpo_turn_advantage],
         }
 
         for ae_name, (ae_type, ae_func) in ae_types.items():
@@ -1259,6 +1261,79 @@ def compute_maxrl_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_advantage_estimator(AdvantageEstimator.GTPO)
+def compute_gtpo_turn_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    gamma: float = 0.9,
+    epsilon: float = 1e-6,
+    is_last_step: np.ndarray = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for GTPO (Group Turn Policy Optimization).
+    Paper: Ding et al., 2025 — https://arxiv.org/abs/2511.14846
+
+    In step-wise training, each row is one turn from one trajectory.
+    ``is_last_step`` marks the final turn of each trajectory so we can
+    identify trajectory boundaries. Within each trajectory, discounted
+    returns are computed backward (Eq 6). Advantages are normalized
+    globally across the entire batch (Eq 7).
+
+    Args:
+        token_level_rewards: (batch_size, seqlen) per-token rewards.
+        response_mask: (batch_size, seqlen) mask for response tokens.
+        index: (batch_size,) groups rows by prompt.
+        gamma: Discount factor (paper optimal: 0.9).
+        epsilon: Numerical stability constant.
+        is_last_step: (batch_size,) bool array marking final turn of each trajectory.
+            If None, falls back to treating each row as a separate trajectory (GRPO-like).
+
+    Returns:
+        (advantages, returns): Both (batch_size, seqlen).
+    """
+    scores = token_level_rewards.sum(dim=-1)
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        raw_returns = torch.zeros_like(scores)
+
+        # Step 1: Identify trajectory boundaries using is_last_step.
+        # Each trajectory is a contiguous block of rows ending with is_last_step=True.
+        if is_last_step is not None:
+            is_last = is_last_step if isinstance(is_last_step, np.ndarray) else is_last_step.cpu().numpy()
+        else:
+            is_last = np.ones(bsz, dtype=bool)
+
+        # Step 2: Compute discounted returns within each trajectory (Eq 6).
+        # R_{i,j} = sum_{m=j}^{T} gamma^{m-j} * r_{i,m}
+        # Backward pass within each trajectory.
+        running_return = torch.tensor(0.0, device=scores.device)
+        # Walk backward through the batch. Trajectories are contiguous blocks.
+        for i in range(bsz - 1, -1, -1):
+            if is_last[i]:
+                running_return = torch.tensor(0.0, device=scores.device)
+            running_return = scores[i] + gamma * running_return
+            raw_returns[i] = running_return
+
+        # Step 3: Global normalization across ALL turns in the batch (Eq 7).
+        # A_{i,j} = (R_{i,j} - mean(R)) / std(R)
+        # The paper normalizes globally, not per-prompt-group.
+        global_mean = raw_returns.mean()
+        global_std = raw_returns.std()
+
+        if global_std > epsilon:
+            normalized = (raw_returns - global_mean) / (global_std + epsilon)
+        else:
+            normalized = raw_returns - global_mean
+
+        advantages = normalized.unsqueeze(-1) * response_mask
+        returns = raw_returns.unsqueeze(-1) * response_mask
+
+    return advantages, returns
 
 
 def repopulate_all_registries():

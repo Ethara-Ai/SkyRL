@@ -975,41 +975,49 @@ class RayPPOTrainer:
             is_last_step = torch.tensor(data.metadata["is_last_step"], dtype=torch.bool)
             index = np.array(data.metadata["uids"])
             values = data["values"]
-            # Step-wise only supports outcome-based estimators (GRPO, RLOO, MAXRL); ensured by `validate_cfg`.
-            # We use the last step of each trajectory to compute advantages and broadcast them to
-            # all steps of that trajectory, so we ignore per-step rewards in step-wise training.
-            # We pass an all-ones mask here so the estimator returns the scalar advantage at every
-            # position. The real per-step `response_mask` is re-applied on broadcast below.
-            # Shapes:
-            #   traj_ids, (batch_size,):         trajectory id per step (cumsum of shifted is_last_step)
-            #   last_step_advantages/returns,
-            #       (num_traj, seqlen):          scalar advantage/return per trajectory at every position
-            #   last_step_advantages/returns[traj_ids],
-            #       (batch_size, seqlen):        broadcast to every step of the owning trajectory
-            #   response_mask_float,
-            #       (batch_size, seqlen):        per-step response mask
-            last_step_response_mask = data["response_mask"][is_last_step]
-            last_step_advantages, last_step_returns = ppo_utils.compute_advantages_and_returns(
-                token_level_rewards=token_level_rewards[is_last_step],
-                response_mask=torch.ones_like(last_step_response_mask, dtype=torch.float),
-                index=index[is_last_step.cpu().numpy()],
-                adv_estimator=self.cfg.trainer.algorithm.advantage_estimator,
-                values=values[is_last_step] if values is not None else None,
-                config=self.cfg.trainer.algorithm,
-                gamma=self.cfg.trainer.algorithm.gamma,
-                lambd=self.cfg.trainer.algorithm.lambd,
-                grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
-            )
-            traj_ids = (
-                torch.cat([torch.tensor([False], device=is_last_step.device), is_last_step[:-1]]).int().cumsum(dim=0)
-            )
-            num_traj = traj_ids[-1].item() + 1
-            assert num_traj == len(
-                last_step_advantages
-            ), f"num_traj {num_traj} doesn't match the number of trajectories as given by `is_last_step` {len(last_step_advantages)}. The `is_last_step` tensor is likely malformed"
-            response_mask_float = data["response_mask"].to(last_step_advantages.dtype)
-            advantages = last_step_advantages[traj_ids] * response_mask_float
-            returns = last_step_returns[traj_ids] * response_mask_float
+
+            if self.cfg.trainer.algorithm.advantage_estimator == "gtpo":
+                # GTPO: pass ALL turns to the estimator with is_last_step metadata.
+                # Each turn gets its own per-turn advantage from discounted returns.
+                # This is the core difference from GRPO — no broadcast from last step.
+                is_last_step_np = is_last_step.cpu().numpy()
+                advantages, returns = ppo_utils.compute_advantages_and_returns(
+                    token_level_rewards=token_level_rewards,
+                    response_mask=data["response_mask"].float(),
+                    index=index,
+                    adv_estimator=self.cfg.trainer.algorithm.advantage_estimator,
+                    values=values,
+                    config=self.cfg.trainer.algorithm,
+                    gamma=self.cfg.trainer.algorithm.gamma,
+                    lambd=self.cfg.trainer.algorithm.lambd,
+                    grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
+                    is_last_step=is_last_step_np,
+                )
+            else:
+                # GRPO/RLOO/MAXRL: outcome-based estimators.
+                # Use last step of each trajectory, broadcast to all steps.
+                last_step_response_mask = data["response_mask"][is_last_step]
+                last_step_advantages, last_step_returns = ppo_utils.compute_advantages_and_returns(
+                    token_level_rewards=token_level_rewards[is_last_step],
+                    response_mask=torch.ones_like(last_step_response_mask, dtype=torch.float),
+                    index=index[is_last_step.cpu().numpy()],
+                    adv_estimator=self.cfg.trainer.algorithm.advantage_estimator,
+                    values=values[is_last_step] if values is not None else None,
+                    config=self.cfg.trainer.algorithm,
+                    gamma=self.cfg.trainer.algorithm.gamma,
+                    lambd=self.cfg.trainer.algorithm.lambd,
+                    grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
+                )
+                traj_ids = (
+                    torch.cat([torch.tensor([False], device=is_last_step.device), is_last_step[:-1]]).int().cumsum(dim=0)
+                )
+                num_traj = traj_ids[-1].item() + 1
+                assert num_traj == len(
+                    last_step_advantages
+                ), f"num_traj {num_traj} doesn't match the number of trajectories as given by `is_last_step` {len(last_step_advantages)}. The `is_last_step` tensor is likely malformed"
+                response_mask_float = data["response_mask"].to(last_step_advantages.dtype)
+                advantages = last_step_advantages[traj_ids] * response_mask_float
+                returns = last_step_returns[traj_ids] * response_mask_float
         else:
             advantages, returns = ppo_utils.compute_advantages_and_returns(
                 token_level_rewards=token_level_rewards,

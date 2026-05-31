@@ -50,7 +50,10 @@ class HarborTrajectoryOutput:
 
 
 def build_step_wise_generator_output(
-    trajectory_outputs: List[HarborTrajectoryOutput], overlong_filtering: bool
+    trajectory_outputs: List[HarborTrajectoryOutput],
+    overlong_filtering: bool,
+    gtpo_turn_rewards: bool = False,
+    gtpo_format_penalty: float = -0.1,
 ) -> GeneratorOutput:
     """Flatten per-trajectory rollout details into one entry per LLM turn.
 
@@ -129,9 +132,24 @@ def build_step_wise_generator_output(
             lp = logprobs_per_turn[t]
             assert len(lp) == len(comp_ids), "logprobs and completion token ids must have the same length."
 
-            # Record actual reward in last turn, and zeros for all other turns.
+            # Record reward per turn.
             is_last = t == n_turns - 1
-            reward = traj.reward if is_last else 0.0
+            if gtpo_turn_rewards:
+                # GTPO turn-level reward (Eq. 5): r_{i,j} = r_acc_{i,j} + r_format_{i,j}
+                r_acc = traj.reward if is_last else 0.0
+                r_format = 0.0
+                # Check format at EVERY turn, not just turn 0.
+                # A very short completion (< 20 tokens) in a non-final turn likely
+                # means the model failed to produce meaningful code/reasoning.
+                if not is_last and len(comp_ids) < 20 and n_turns > 1:
+                    r_format = gtpo_format_penalty
+                # First turn must contain substantial content for TIR tasks.
+                if t == 0 and len(comp_ids) < 20:
+                    r_format = gtpo_format_penalty
+                reward = r_acc + r_format
+            else:
+                # GRPO: only last turn gets reward
+                reward = traj.reward if is_last else 0.0
 
             # Loss mask.
             step_loss_mask = [1] * len(comp_ids)
@@ -206,6 +224,8 @@ class HarborGenerator(GeneratorInterface):
         self.generator_cfg = generator_cfg
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
+        self.gtpo_turn_rewards = getattr(generator_cfg, "gtpo_turn_rewards", False)
+        self.gtpo_format_penalty = getattr(generator_cfg, "gtpo_format_penalty", -0.1)
 
         if not getattr(generator_cfg, "step_wise_trajectories", False):
             raise ValueError(
@@ -284,7 +304,10 @@ class HarborGenerator(GeneratorInterface):
             progress.close()
 
         return build_step_wise_generator_output(
-            all_outputs, overlong_filtering=self.generator_cfg.apply_overlong_filtering
+            all_outputs,
+            overlong_filtering=self.generator_cfg.apply_overlong_filtering,
+            gtpo_turn_rewards=self.gtpo_turn_rewards,
+            gtpo_format_penalty=self.gtpo_format_penalty,
         )
 
     async def _harbor_agent_loop(

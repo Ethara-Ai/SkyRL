@@ -283,6 +283,8 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     # uniformly to every step's response tokens. This only makes sense for outcome-based estimators.
     # Temporal estimators (GAE, REINFORCE++) produce per-token advantages, which the broadcast
     # discards. Reject the combination explicitly.
+    # NOTE: GTPO is allowed with step_wise because it has a dedicated branch in trainer.py
+    # that passes all turns to the estimator instead of filtering to last-step only.
     if cfg.generator.step_wise_trajectories and cfg.trainer.algorithm.advantage_estimator in ("gae", "reinforce++"):
         raise ValueError(
             f"advantage_estimator={cfg.trainer.algorithm.advantage_estimator!r} is not supported with "
