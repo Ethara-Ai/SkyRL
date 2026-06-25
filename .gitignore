@@ -13,13 +13,13 @@ docs/public/api-ref/
 .cache/
 .pytest_cache/
 
-# NOTE (sumanthrh): Don't add .env to gitignore. .env file when passed to uv is used to set env vars for each ray worker process. 
+# NOTE (sumanthrh): Don't add .env to gitignore. .env file when passed to uv is used to set env vars for each ray worker process.
 # If it's in .gitignore then it won't be a part of the working directory shipped by uv and your env vars will not be set.
 # This will just appear as a warning (silent failure) and you're gonna have a bad time.
 # .env
 
 # .env files inside directories can be ignored
-/skyrl-gym/.env 
+/skyrl-gym/.env
 
 /skyrl-gym/.venv
 
@@ -125,4 +125,6 @@ tx/tinker/alembic/__pycache__/
 *.db-shm
 
 # claude settings
-.claude/settings.json
+.claude/
+CLAUDE.md
+AGENTS.md
