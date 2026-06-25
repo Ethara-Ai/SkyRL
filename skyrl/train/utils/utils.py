@@ -6,6 +6,7 @@ import os
 import socket
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -207,7 +208,9 @@ def validate_megatron_cfg(cfg: SkyRLTrainConfig):
     for config, worker_type in worker_configs:
         # context, expert, and expert tensor parallel are not yet supported for megatron
         if config.megatron_config.context_parallel_size > 1:
-            assert cfg.trainer.use_sample_packing, "context parallel is only supported with sample packing"
+            assert (
+                cfg.trainer.remove_microbatch_padding
+            ), "context parallel is only supported with remove_microbatch_padding"
         # check that sequence parallel is not configured outside of megatron
         assert config.sequence_parallel_size == 1, (
             f"found {worker_type}.sequence_parallel_size={config.sequence_parallel_size}, ulysses style sequence "
@@ -226,6 +229,10 @@ def validate_cfg(cfg: SkyRLTrainConfig):
             stacklevel=2,
         )
         cfg.trainer.strategy = "fsdp"
+
+    if cfg.trainer.max_training_steps is not None:
+        if cfg.trainer.max_training_steps <= 0:
+            raise ValueError(f"max_training_steps must be > 0, got {cfg.trainer.max_training_steps}")
 
     # Validate generation config separately
     validate_generator_cfg(cfg)
@@ -312,9 +319,11 @@ def validate_cfg(cfg: SkyRLTrainConfig):
         "token_mean_legacy",
         "sequence_mean",
         "seq_mean_token_sum_norm",
+        "prompt_mean",
     ), (
         f"invalid loss_reduction: {cfg.trainer.algorithm.loss_reduction}. "
-        f"Must be one of `['token_mean', 'sequence_mean', 'seq_mean_token_sum_norm']`"
+        f"Must be one of `['token_mean', 'token_mean_legacy', 'sequence_mean', "
+        f"'seq_mean_token_sum_norm', 'prompt_mean']`"
     )
     if cfg.trainer.algorithm.loss_reduction == "seq_mean_token_sum_norm":
         if cfg.trainer.algorithm.max_seq_len is None:
@@ -419,16 +428,6 @@ def validate_generator_cfg(cfg: SkyRLTrainConfig):
             "for multi-turn generation"
         )
 
-    if ie_cfg.enable_pd:
-        assert ie_cfg.num_prefill > 0, "num_prefill must be > 0 when enable_pd=True"
-        assert (
-            ie_cfg.num_prefill < ie_cfg.num_engines
-        ), "num_prefill must be < num_engines (need at least one decode worker)"
-        assert ie_cfg.num_engines >= 2, "num_engines must be >= 2 for PD disaggregation"
-
-    if not ie_cfg.run_engines_locally:
-        assert ie_cfg.num_engines == len(ie_cfg.remote_urls), "num_engines should be equal to the number of remote_urls"
-
     if not ie_cfg.async_engine and ie_cfg.backend == "vllm":
         assert (
             cfg.generator.batched
@@ -438,14 +437,6 @@ def validate_generator_cfg(cfg: SkyRLTrainConfig):
     if cfg.trainer.logger == "wandb":
         assert os.environ.get("WANDB_API_KEY"), "`WANDB_API_KEY` is required for `wandb` logger"
 
-    if ie_cfg.override_existing_update_group == "auto":
-        if ie_cfg.backend == "vllm" and not ie_cfg.run_engines_locally:
-            # remote engines can be launched separately so we `enable` by default
-            ie_cfg.override_existing_update_group = "enable"
-        else:
-            # for local engines, we disable
-            ie_cfg.override_existing_update_group = "disable"
-
     if cfg.generator.sampling_params.logprobs is not None:
         assert isinstance(cfg.generator.sampling_params.logprobs, int)
         if cfg.generator.sampling_params.logprobs > 1:
@@ -453,8 +444,8 @@ def validate_generator_cfg(cfg: SkyRLTrainConfig):
                 f"`logprobs` if set should be 0 or 1 (both return only the chosen token's logprob), "
                 f"got {cfg.generator.sampling_params.logprobs}"
             )
-        if not ie_cfg.run_engines_locally:
-            raise NotImplementedError("Remote inference mode doesn't support `sampling_params.logprobs`")
+        if not _SKYRL_USE_NEW_INFERENCE and not ie_cfg.run_engines_locally:
+            raise NotImplementedError("Legacy remote inference mode doesn't support `sampling_params.logprobs`")
 
     if cfg.trainer.strategy == "megatron":
         validate_megatron_cfg(cfg)
@@ -468,6 +459,48 @@ def validate_generator_cfg(cfg: SkyRLTrainConfig):
                 " to `True` to append tokenizer.eos_token_id to the assistant-generated response "
                 "to match the chat template."
             )
+
+    # Validate inference-engine instantiation / serving topology (shared with
+    # the inference-only serve entrypoint).
+    validate_inference_engine_cfg(cfg)
+
+
+def validate_inference_engine_cfg(cfg: SkyRLTrainConfig):
+    """Validates inference-engine config independent of generator/training semantics.
+
+    Covers engine instantiation and serving topology
+
+    Shared between the training path (via :func:`validate_generator_cfg`) and the
+    inference-only serve entrypoint (``skyrl.train.entrypoints.serve``).
+
+    NOTE: this also resolves ``inference_engine.override_existing_update_group="auto"``
+    in place.
+
+    Args:
+        cfg (SkyRLTrainConfig): config to validate
+
+    Raises:
+        ValueError / NotImplementedError / AssertionError: on invalid combinations.
+    """
+    ie_cfg = cfg.generator.inference_engine
+
+    if ie_cfg.enable_pd:
+        assert ie_cfg.num_prefill > 0, "num_prefill must be > 0 when enable_pd=True"
+        assert (
+            ie_cfg.num_prefill < ie_cfg.num_engines
+        ), "num_prefill must be < num_engines (need at least one decode worker)"
+        assert ie_cfg.num_engines >= 2, "num_engines must be >= 2 for PD disaggregation"
+
+    if not _SKYRL_USE_NEW_INFERENCE and not ie_cfg.run_engines_locally:
+        assert ie_cfg.num_engines == len(ie_cfg.remote_urls), "num_engines should be equal to the number of remote_urls"
+
+    if ie_cfg.override_existing_update_group == "auto":
+        if ie_cfg.backend == "vllm" and not ie_cfg.run_engines_locally:
+            # remote engines can be launched separately so we `enable` by default
+            ie_cfg.override_existing_update_group = "enable"
+        else:
+            # for local engines, we disable
+            ie_cfg.override_existing_update_group = "disable"
 
     if ie_cfg.enable_http_endpoint:
         if not ie_cfg.async_engine:
@@ -615,6 +648,10 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         # useful when tp > 1 (and thus megatron sequence_parallel is enabled)
         # see: https://github.com/NVIDIA/Megatron-LM/issues/533#issuecomment-1760193239
         env_vars["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+        # Propagate fla's GDN backend choice to Ray workers. Default 1 keeps fla's
+        # TileLang default (works on Hopper); export FLA_TILELANG=0 on Blackwell (B200),
+        # where the TileLang packed backward aborts, to fall back to the Triton kernels.
+        env_vars["FLA_TILELANG"] = os.environ.get("FLA_TILELANG", "1")
         if cfg.trainer.flash_attn:
             # disable fused attention for megatron with flash_attn
             # (otherwise flash_attn choice is overridden in TransformerEngine for Hopper+ devices)
@@ -978,15 +1015,30 @@ def peer_access_supported(max_num_gpus_per_node: int):
 
 
 def update_model_config(module_config, override_config_kwargs):
-    """Update the module config with the override_config_kwargs.
+    """Return a copy of ``module_config`` with ``override_config_kwargs`` applied.
+
+    The returned config is a deep copy, so the caller's input is left
+    unmodified. Nested dict values in ``override_config_kwargs`` recurse into
+    the corresponding sub-config attribute (which is already part of the deep
+    copy, so the recursion mutates the copy in place).
 
     Args:
         module_config: The module config from Huggingface Transformers.
         override_config_kwargs: The kwargs to override the module config.
+
+    Returns:
+        A new module config with the overrides applied.
     """
+    new_config = deepcopy(module_config)
+    _apply_overrides_in_place(new_config, override_config_kwargs)
+    return new_config
+
+
+def _apply_overrides_in_place(module_config, override_config_kwargs):
+    """Apply override kwargs to ``module_config`` in place (used for sub-configs)."""
     for key, val in override_config_kwargs.items():
         if isinstance(val, dict):
-            update_model_config(getattr(module_config, key), val)
+            _apply_overrides_in_place(getattr(module_config, key), val)
         else:
             setattr(module_config, key, val)
 

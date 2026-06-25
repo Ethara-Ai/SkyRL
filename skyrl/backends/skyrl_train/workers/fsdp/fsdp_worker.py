@@ -137,7 +137,10 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         assert self.cfg.strategy == "fsdp"
         strategy = FSDPStrategy(
             fsdp_config=self.cfg.policy.fsdp_config,
-            optimizer_config=self.cfg.policy.optimizer_config,
+            # Inference-only workers skip the optimizer entirely: passing None makes
+            # FSDPStrategy.prepare return (model, None, None), avoiding the fp32 master
+            # weights + AdamW state that would OOM memory-constrained nodes.
+            optimizer_config=None if self.cfg.policy.inference_only_init else self.cfg.policy.optimizer_config,
             model_config=self.cfg.policy.model,
             fsdp_strategy=self.cfg.strategy,
             seed=self.cfg.seed,
@@ -159,7 +162,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         wrapped_model = HFModelWrapper(
             model_path,
             use_flash_attention_2=self.cfg.flash_attn,
-            bf16=False,
+            bf16=self.cfg.policy.inference_only_init,
             lora_rank=self.cfg.policy.model.lora.rank,
             lora_alpha=self.cfg.policy.model.lora.alpha,
             lora_dropout=self.cfg.policy.model.lora.dropout,
@@ -167,7 +170,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             target_modules=self.cfg.policy.model.lora.target_modules,
             exclude_modules=self.cfg.policy.model.lora.exclude_modules,
             sequence_parallel_size=self.cfg.policy.sequence_parallel_size,
-            use_sample_packing=self.cfg.use_sample_packing,
+            remove_microbatch_padding=self.cfg.remove_microbatch_padding,
             use_torch_compile=self.cfg.policy.use_torch_compile,
             rope_scaling=get_rope_scaling_config(self.cfg),
             rope_theta=get_rope_theta_config(self.cfg),
@@ -186,9 +189,18 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         self.model, self.optimizer, self.scheduler = strategy.prepare(
             (wrapped_model, None, None),
         )
-        assert (
-            self.optimizer is not None and self.scheduler is not None
-        ), "FSDP preparation should create optimizer and scheduler"
+        if self.cfg.policy.inference_only_init:
+            assert (
+                self.optimizer is None and self.scheduler is None
+            ), "inference_only_init should skip optimizer and scheduler construction"
+        else:
+            assert (
+                self.optimizer is not None and self.scheduler is not None
+            ), "FSDP preparation should create optimizer and scheduler"
+
+        # Enable expandable_segments after init so model weights stay in IPC-compatible
+        # standard CUDA memory; only subsequent activations use expandable segments.
+        self._set_expandable_segments(True)
 
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
         # Call super first to set _transfer_strategy_cls and create sender/receivers
@@ -264,9 +276,15 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         use_prefix_cache = inference_engine_cfg.enable_prefix_caching
         generator_dtype = str_to_torch_dtype(inference_engine_cfg.model_dtype)
         cache_reset_task = None
-        if use_prefix_cache and torch.distributed.get_rank() == 0:
+
+        # Clear prefix cache for synchronous training or for async training if `clear_kv_cache_on_weight_sync` is set
+        if (
+            use_prefix_cache
+            and torch.distributed.get_rank() == 0
+            and (not self.cfg.fully_async.enabled or self.cfg.fully_async.clear_kv_cache_on_weight_sync)
+        ):
             # clear prefix cache
-            cache_reset_task = inference_engine_client.reset_prefix_cache()
+            cache_reset_task = inference_engine_client.reset_prefix_cache(reset_running_requests=True)
 
         torch.cuda.empty_cache()
 
@@ -278,23 +296,25 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
             # Multi-tenant: per-adapter subdir + per-adapter vLLM name.
             # Single-tenant (model_id=None) keeps the legacy shared path +
-            # name. basename guards against a malformed model_id escaping
-            # lora_sync_path even though api.py already validates IDs.
-            base_sync_path = self.cfg.policy.model.lora.lora_sync_path
-            safe_model_id = os.path.basename(model_id) if model_id is not None else None
-            lora_name = safe_model_id if safe_model_id else SKYRL_LORA_ADAPTER_NAME
-            lora_sync_path = os.path.join(base_sync_path, safe_model_id) if safe_model_id else base_sync_path
+            # name. _resolve_lora_sync_target (shared with Megatron, defined on
+            # PolicyWorkerBase) basename-guards against a malformed model_id
+            # escaping lora_sync_path even though api.py already validates IDs.
+            lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
             await self._save_lora_adapters_and_sync(
                 peft_model, lora_sync_path, inference_engine_client, lora_name=lora_name
             )
         else:
-            # Extract and send weights using the sender created at init time
-            weight_iterator = self.weight_extractor.extract_weights(generator_dtype)
-            weight_metadata = self.weight_extractor.get_weight_metadata(generator_dtype)
-            await self._weight_transfer_sender.send_chunks(
-                weight_iterator,
-                weight_metadata=weight_metadata,
-            )
+            # Extract and send weights using the sender created at init time.
+            # Disable expandable_segments around the send: under colocate_all the
+            # CUDA-IPC path calls cudaIpcGetMemHandle, which is incompatible with the
+            # VMM addresses expandable segments uses.
+            with self._expandable_segments_disabled_for_sync():
+                weight_iterator = self.weight_extractor.extract_weights(generator_dtype)
+                weight_metadata = self.weight_extractor.get_weight_metadata(generator_dtype)
+                await self._weight_transfer_sender.send_chunks(
+                    weight_iterator,
+                    weight_metadata=weight_metadata,
+                )
 
         if cache_reset_task is not None:
             await cache_reset_task
@@ -352,7 +372,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             value_head_prefix=self.cfg.algorithm.value_head_prefix,
             init_value_head=self.cfg.policy.model.path == self.cfg.critic.model.path,
             sequence_parallel_size=self.cfg.critic.sequence_parallel_size,
-            use_sample_packing=self.cfg.use_sample_packing,
+            remove_microbatch_padding=self.cfg.remove_microbatch_padding,
             model_config_kwargs=self.cfg.critic.model_config_kwargs,
             meta_init=use_meta,
         )
@@ -368,6 +388,8 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             (critic, None, None),
         )
         assert self.optimizer is not None
+
+        self._set_expandable_segments(True)
 
     def _set_pad_token_id(self, pad_token_id):
         self.model.config.pad_token_id = pad_token_id
@@ -407,7 +429,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
             use_flash_attention_2=self.cfg.flash_attn,
             bf16=self.cfg.bf16,
             sequence_parallel_size=self.cfg.ref.sequence_parallel_size,
-            use_sample_packing=self.cfg.use_sample_packing,
+            remove_microbatch_padding=self.cfg.remove_microbatch_padding,
             rope_scaling=get_rope_scaling_config(self.cfg),
             rope_theta=get_rope_theta_config(self.cfg),
             model_config_kwargs=self.cfg.ref.model_config_kwargs,
@@ -419,6 +441,8 @@ class FSDPRefWorkerBase(RefWorkerBase):
 
         self.model = strategy.prepare(wrapped_model)
         self.model.eval()
+
+        self._set_expandable_segments(True)
 
     def forward(
         self,

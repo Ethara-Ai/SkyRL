@@ -1,4 +1,5 @@
 import asyncio
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import List, Optional
@@ -7,10 +8,12 @@ from uuid import uuid4
 from skyrl.train.generators.base import GeneratorInterface, GeneratorInput, GeneratorOutput, TrajectoryID
 from skyrl.train.generators.utils import get_rollout_metrics
 from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
+from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import RemoteInferenceClient
 from skyrl.backends.skyrl_train.inference_engines.base import ConversationType
 from skyrl.train.utils.rate_limiter import create_rate_limiter
 from tqdm import tqdm
 from omegaconf import DictConfig
+from skyrl.env_vars import _SKYRL_USE_NEW_INFERENCE
 from harbor.trial.trial import Trial
 from harbor.models.trial.config import TrialConfig
 from harbor.models.agent.rollout_detail import RolloutDetail
@@ -47,6 +50,9 @@ class HarborTrajectoryOutput:
     # One of: "complete", "context_length", "agent_timeout", "error". Used by
     # `build_step_wise_generator_output` to decide whether to skip the entire prompt group.
     stop_reason: str = "complete"
+    # End-to-end wall-clock time (seconds) to generate this trajectory. Optional: left as None if
+    # timing was not recorded.
+    e2e_time: Optional[float] = None
 
 
 def build_step_wise_generator_output(
@@ -93,6 +99,12 @@ def build_step_wise_generator_output(
     successful_trajectories: List[HarborTrajectoryOutput] = []
     response_ids_for_metrics: List[List[int]] = []
     rewards_for_metrics: List[float] = []
+    # One generation time per successful trajectory; used for completion-time metrics (avoids the
+    # duplicate per-step entries below inflating the stats).
+    trajectory_generation_times_per_prompt: List[Optional[float]] = []
+    # One generation time per emitted step, aligned 1:1 with the flattened per-step arrays above.
+    # Per trajectory we replicate its trajectory-level e2e_time across all of its steps.
+    out_trajectory_generation_times: List[Optional[float]] = []
     for traj in trajectory_outputs:
         tid = traj.trajectory_id
 
@@ -106,6 +118,7 @@ def build_step_wise_generator_output(
             is_last_step_list.append(True)
             out_trajectory_ids.append(tid)
             rollout_logprobs_list.append([0.0])
+            out_trajectory_generation_times.append(traj.e2e_time)
             continue
 
         # 2.2. For successful trajectories, emit one entry per step.
@@ -167,15 +180,29 @@ def build_step_wise_generator_output(
             is_last_step_list.append(is_last)
             out_trajectory_ids.append(tid)
             rollout_logprobs_list.append(lp)
+            # For trajectory completion per turn we just use the trajectory-level e2e time.
+            out_trajectory_generation_times.append(traj.e2e_time)
 
         # 2.5. For trajectory-level metrics, record the last turn's prompt IDs and response IDs which
         # contains the entire trajectory.
         response_ids_for_metrics.append(prompt_token_ids_per_turn[-1] + completion_token_ids_per_turn[-1])
         rewards_for_metrics.append(traj.reward)
+        trajectory_generation_times_per_prompt.append(traj.e2e_time)
 
     # 3. Aggregate trajectory-level metrics for logging.
+    # ``e2e_time`` is optional; if any trajectory did not record it, we omit the completion-time
+    # fields entirely rather than emit a partially-populated list.
+    # NOTE: metrics use the per-prompt times (not the per-step duplicates) to avoid skewing the stats.
+    if any(t is None for t in trajectory_generation_times_per_prompt):
+        trajectory_generation_times_per_prompt = None
+    if any(t is None for t in out_trajectory_generation_times):
+        out_trajectory_generation_times = None
     if successful_trajectories:
-        rollout_metrics = get_rollout_metrics(response_ids_for_metrics, rewards_for_metrics)
+        rollout_metrics = get_rollout_metrics(
+            response_ids_for_metrics,
+            rewards_for_metrics,
+            trajectory_completion_times=trajectory_generation_times_per_prompt,
+        )
         rollout_metrics["generate/trajectories_context_length_exceeded"] = sum(
             1 for t in successful_trajectories if t.stop_reason == "context_length"
         )
@@ -199,6 +226,8 @@ def build_step_wise_generator_output(
         rollout_logprobs=rollout_logprobs_list,
         trajectory_ids=out_trajectory_ids,
         is_last_step=is_last_step_list,
+        # Per-step times, aligned 1:1 with the flattened per-step arrays above.
+        trajectory_generation_times=out_trajectory_generation_times,
     )
 
 
@@ -220,7 +249,14 @@ class HarborGenerator(GeneratorInterface):
             max_seq_len: Maximum total sequence length (prompt + response). Used to truncate responses.
         """
         ie_cfg = generator_cfg.inference_engine
-        self.base_url = f"http://{ie_cfg.http_endpoint_host}:{ie_cfg.http_endpoint_port}"
+        if _SKYRL_USE_NEW_INFERENCE:
+            assert isinstance(inference_engine_client, RemoteInferenceClient)
+            self.base_url = inference_engine_client.proxy_url
+        else:
+            self.base_url = f"http://{ie_cfg.http_endpoint_host}:{ie_cfg.http_endpoint_port}"
+        # Kept so we can notify the router when a session (trial attempt) ends,
+        # which lets session-aware routing policies rebalance new trajectories.
+        self.inference_engine_client = inference_engine_client
         self.generator_cfg = generator_cfg
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
@@ -318,6 +354,7 @@ class HarborGenerator(GeneratorInterface):
         """Run a single Harbor trial and return the rollout details plus a trajectory-level reward.
         Retries on unknown errors; context length errors train with reward=0; agent timeouts mask the trajectory.
         """
+        agent_loop_start_time = time.monotonic()
         reward = None
         results = None
         rollout_details = None
@@ -329,11 +366,14 @@ class HarborGenerator(GeneratorInterface):
         for i in range(MAX_NUM_RETRIES_PER_TRIAL):
             prefix = f"Trajectory {trajectory_id} attempt {i+1}/{MAX_NUM_RETRIES_PER_TRIAL}"
             results = None
+            # Each attempt is a distinct router session; track it so it can be
+            # released on completion/error/cancellation.
+            session_id = uuid4().hex
             try:
                 # Create a fresh Trial each attempt so agent state is clean on retry.
                 config = deepcopy(self._harbor_trial_config_template)
                 config["task"] = {"path": prompt}
-                config["agent"]["kwargs"]["session_id"] = uuid4().hex
+                config["agent"]["kwargs"]["session_id"] = session_id
                 trial_config = TrialConfig.model_validate(config)
                 trial = await Trial.create(trial_config)
 
@@ -378,6 +418,9 @@ class HarborGenerator(GeneratorInterface):
             except Exception as e:
                 logger.warning(f"{prefix} failed: Error running trial: {e}. Results: {results}")
                 continue
+            finally:
+                if _SKYRL_USE_NEW_INFERENCE:
+                    await self.inference_engine_client.finish_session(session_id)
 
         if not successful:
             stop_reason = "agent_timeout" if is_agent_timeout_error else "error"
@@ -385,7 +428,12 @@ class HarborGenerator(GeneratorInterface):
             if stop_reason == "error":
                 error_message += f" Results: {results}"
             logger.warning(error_message)
-            return HarborTrajectoryOutput(trajectory_id=trajectory_id, rollout_details=None, stop_reason=stop_reason)
+            return HarborTrajectoryOutput(
+                trajectory_id=trajectory_id,
+                rollout_details=None,
+                stop_reason=stop_reason,
+                e2e_time=time.monotonic() - agent_loop_start_time,
+            )
         else:
             return HarborTrajectoryOutput(
                 trajectory_id=trajectory_id,
@@ -393,4 +441,5 @@ class HarborGenerator(GeneratorInterface):
                 reward=reward,
                 num_turns=num_turns,
                 stop_reason="context_length" if is_context_length_error else "complete",
+                e2e_time=time.monotonic() - agent_loop_start_time,
             )

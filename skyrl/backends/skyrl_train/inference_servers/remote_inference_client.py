@@ -872,6 +872,41 @@ class RemoteInferenceClient:
 
         return results
 
+    async def finish_session(self, session_id: str) -> None:
+        """Notify the router that a session (trajectory) is complete.
+
+        Best-effort data-plane call to the router's ``/finish_session`` endpoint.
+        Session-aware routing policies (e.g. ``sticky_least_loaded``)
+        use this to release the replica capacity held by the session so that new
+        trajectories are balanced onto less-busy engines.
+
+        Failures are logged but never raised: this runs in trajectory cleanup
+        paths (``finally`` blocks, cancellation handlers) and must not mask the
+        original outcome. Routers/policies that don't track sessions treat this
+        as a no-op, and unknown session ids are ignored server-side.
+        """
+        if not session_id:
+            return
+        url = f"{self.proxy_url}/finish_session"
+        try:
+            session = await self._get_session()
+            # Bound this best-effort cleanup call: the shared session has no
+            # timeout (total=None), so an unresponsive router would otherwise
+            # hang the trajectory's finally block forever and wedge the loop.
+            async with session.post(
+                url,
+                params={"session_id": str(session_id)},
+                timeout=aiohttp.ClientTimeout(total=10.0),
+            ) as resp:
+                # Drain the body so the keep-alive connection can be reused.
+                await resp.read()
+                if resp.status >= 400:
+                    logger.warning(f"finish_session for session_id={session_id!r} returned HTTP {resp.status}")
+        except asyncio.TimeoutError:
+            logger.warning(f"finish_session for session_id={session_id!r} timed out after 10s (router unresponsive)")
+        except Exception as e:
+            logger.warning(f"finish_session for session_id={session_id!r} failed: {e}")
+
     # ---------------------------
     # Control Plane (fan-out to all server_urls)
     # ---------------------------
@@ -1085,7 +1120,7 @@ class RemoteInferenceClient:
 
         Calls the NewInferenceWorkerWrap.start_weight_update method on all
         workers. For checkpoint-format weights this initializes layerwise
-        reload. Must be called before any update_weights_chunk calls.
+        reload. Must be called before any update_weights_ipc calls.
 
         Args:
             is_checkpoint_format: True if weights are in checkpoint format
@@ -1102,14 +1137,14 @@ class RemoteInferenceClient:
             },
         )
 
-    async def update_weights_chunk(
+    async def update_weights_ipc(
         self,
         update_info: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
         Send a single weight chunk via /collective_rpc.
 
-        Calls NewInferenceWorkerWrap.update_weights_chunk on all workers.
+        Calls NewInferenceWorkerWrap.update_weights_ipc on all workers.
         Can be called multiple times between start_weight_update and
         finish_weight_update.
 
@@ -1123,7 +1158,36 @@ class RemoteInferenceClient:
         return await self._call_all_servers(
             "/collective_rpc",
             {
-                "method": "update_weights_chunk",
+                "method": "update_weights_ipc",
+                "kwargs": {"update_info": update_info},
+            },
+        )
+
+    async def update_weights_nccl(
+        self,
+        update_info: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Send batched weight update via /collective_rpc to the broadcast receiver.
+
+        Calls NewInferenceWorkerWrap.update_weights_nccl on all workers,
+        which routes weight_transfer_engine.receive_weights through the
+        set_current_vllm_config wrap. Used by the broadcast (NCCL) sender as
+        a temporary substitute for vLLM's native /update_weights endpoint
+        until the upstream patch (vllm-project/vllm weight-sync-fix) lands.
+
+        Args:
+            update_info: Dict with backend-specific update info (names,
+                dtype_names, shapes, packed flag, etc.) — same shape vLLM's
+                native /update_weights expects.
+
+        Returns:
+            Dict mapping server_url to response.
+        """
+        return await self._call_all_servers(
+            "/collective_rpc",
+            {
+                "method": "update_weights_nccl",
                 "kwargs": {"update_info": update_info},
             },
         )

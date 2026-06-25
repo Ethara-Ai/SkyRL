@@ -703,6 +703,8 @@ class SFTTrainer:
         self.global_step = 0
         # running count of total non-padding tokens trained on
         self._total_tokens_processed = 0
+        self.collator = None  # built in setup() once the tokenizer is available
+
         self._num_training_gpus: int = cfg.placement.num_nodes * cfg.placement.num_gpus_per_node
         self._ray_gpu_monitor = RayGpuMonitor() if cfg.enable_ray_gpu_monitor else None
 
@@ -712,6 +714,61 @@ class SFTTrainer:
         self._total_steps: int = 0
         self._steps_per_epoch: int = 0
         self._current_epoch: int = 0
+
+    def _build_collator(self, tokenizer):
+        """Select the batch collator from the configured packing mode.
+
+        ``PackedDataCollator`` performs controller-level FFD bin-packing
+        (Megatron-only, ``use_sequence_packing=True``); ``DefaultCollator``
+        left-pads each example. The choice is fixed by static config; the
+        ``tokenizer`` is passed in by :meth:`setup` once it is available. The
+        packed config is validated here.
+        """
+        # Imported lazily to avoid a circular import: ``collators`` imports
+        # ``collate_sft_batch`` from this module.
+        from skyrl.train.dataset.collators import DefaultCollator, PackedDataCollator
+
+        if self.sft_cfg.use_sequence_packing:
+            self._validate_packing_cfg()
+            return PackedDataCollator(
+                tokenizer=tokenizer,
+                max_tokens_per_microbatch=self.sft_cfg.resolved_bin_capacity(),
+                tp_size=self.sft_cfg.megatron_config.tensor_model_parallel_size,
+                pp_size=self.sft_cfg.megatron_config.pipeline_model_parallel_size,
+                cp_size=self.sft_cfg.megatron_config.context_parallel_size,
+                dp_size=self._dp_size(),
+                batch_size=self.sft_cfg.batch_size,
+                micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
+            )
+        return DefaultCollator(
+            tokenizer=tokenizer,
+            micro_train_batch_size_per_gpu=self.sft_cfg.micro_train_batch_size_per_gpu,
+        )
+
+    def _dp_size(self) -> int:
+        """Number of DP ranks under the configured Megatron parallelism."""
+        total_gpus = self.sft_cfg.placement.num_nodes * self.sft_cfg.placement.num_gpus_per_node
+        tp = self.sft_cfg.megatron_config.tensor_model_parallel_size
+        pp = self.sft_cfg.megatron_config.pipeline_model_parallel_size
+        cp = self.sft_cfg.megatron_config.context_parallel_size
+        return total_gpus // (tp * pp * cp)
+
+    def _validate_packing_cfg(self):
+        """Validate the config when ``use_sequence_packing=True``."""
+        if self.sft_cfg.strategy != "megatron":
+            raise ValueError(
+                f"use_sequence_packing=True only supports strategy='megatron'; got "
+                f"{self.sft_cfg.strategy!r}. Use the FSDP packing path instead."
+            )
+        # Sequence packing needs the THD layout, so it implies
+        # remove_microbatch_padding=True. Auto-enable it (warning if the user
+        # explicitly set it False) instead of erroring on the contradiction.
+        if not self.sft_cfg.remove_microbatch_padding:
+            logger.warning(
+                "use_sequence_packing=True requires the THD layout; "
+                "setting remove_microbatch_padding=True (was False)."
+            )
+            self.sft_cfg.remove_microbatch_padding = True
 
     # ------------------------------------------------------------------ #
     # Setup
@@ -729,6 +786,7 @@ class SFTTrainer:
             use_fast=not self.cfg.trainer.disable_fast_tokenizer,
             padding_side="left",
         )
+        self.collator = self._build_collator(self.tokenizer)
         self._init_tracker()
         self._init_workers()
 
@@ -766,8 +824,14 @@ class SFTTrainer:
         num_training_steps = (
             self.sft_cfg.dummy_run_max_steps if self.sft_cfg.dummy_run_full_ctx else self.sft_cfg.num_steps
         )
-        # num_steps may be None when num_epochs is used; the worker will use its
-        # default (large value) for the LR scheduler in that case.
+        if self.sft_cfg.max_training_steps is not None:
+            num_training_steps = (
+                self.sft_cfg.max_training_steps
+                if num_training_steps is None
+                else min(num_training_steps, self.sft_cfg.max_training_steps)
+            )
+        # num_steps may be None when num_epochs is used; without an explicit cap,
+        # the worker will use its default large value for the LR scheduler.
         ray.get(
             actor_group.async_init_model(
                 self.sft_cfg.model.path,
@@ -784,6 +848,7 @@ class SFTTrainer:
             experiment_name=self.cfg.trainer.run_name,
             backends=self.cfg.trainer.logger,
             config=self.sft_cfg,
+            tags=self.cfg.trainer.tags,
         )
 
     def add_callback(self, callback: TrainingCallback) -> None:
@@ -1048,32 +1113,18 @@ class SFTTrainer:
         )
 
     def collate_batch(self, examples: list, batch_size: int) -> TrainingInputBatch:
-        """Collate examples into a TrainingInputBatch with loss normalization.
+        """Collate examples into a TrainingInputBatch via the configured collator.
 
-        Normalizes the loss_mask so that the sum-reduction in cross_entropy_loss
-        produces a per-non-pad-token mean, matching the standard convention.
-
-        NOTE: The scaling factor is ``batch_size / (micro_batch_size * total_nonpad)``
-        where ``total_nonpad`` is the count of non-masked (loss-contributing)
-        tokens in the full batch.  This accounts for the ``microbatch_weight``
-        (FSDP) or ``1/num_microbatches`` (Megatron) applied during gradient
-        accumulation so that the effective gradient equals
-        ``d[sum(-log_probs_on_nonpad) / total_nonpad]``.
+        Delegates to ``self.collator`` (``DefaultCollator`` or, when sequence
+        packing is enabled, ``PackedDataCollator``).
 
         Args:
             examples: Tokenized examples to collate.
-            batch_size: Global batch dimension used in the loss-mask scaling
-                factor. Required; the train path passes ``sft_cfg.batch_size``
-                and the eval path passes its per-dispatch chunk size.
+            batch_size: Global batch dimension. The train path passes
+                ``sft_cfg.batch_size`` and the eval path passes its
+                per-dispatch chunk size.
         """
-        batch = collate_sft_batch(examples, self.tokenizer)
-        # Loss normalization: divide by non-pad token count (not padded seq length)
-        # NOTE (sumanthrh): This specific scaling factor is because SkyRL's workers internally normalize
-        # by number of micro batches, but aggregate otherwise
-        micro_batch_size = self.sft_cfg.micro_train_batch_size_per_gpu
-        total_nonpad = max(batch["loss_mask"].sum().item(), 1)
-        batch["loss_mask"] = batch["loss_mask"].float() * (batch_size / (micro_batch_size * total_nonpad))
-        return batch
+        return self.collator(examples, batch_size=batch_size)
 
     # ------------------------------------------------------------------ #
     # Checkpoint resume
@@ -1206,7 +1257,7 @@ class SFTTrainer:
             start = batch_idx * eval_chunk_size
             end = min(start + eval_chunk_size, num_eval)
             batch_examples = eval_tokenized[start:end]
-            batch = self.collate_batch(batch_examples, batch_size=eval_chunk_size)
+            batch = self.collator(batch_examples, batch_size=eval_chunk_size)
             # Pad the last (possibly-short) chunk so every dispatch sees exactly
             # ``eval_chunk_size`` rows. ``pad_training_input_batch`` zeros the
             # ``loss_mask`` for padding rows; with ``pad_size=0`` it is a no-op.
@@ -1264,6 +1315,23 @@ class SFTTrainer:
         """Validate that batch_size is compatible with data-parallel and micro-batch sizes."""
         batch_size = self.sft_cfg.batch_size
         total_gpus = self.sft_cfg.placement.num_nodes * self.sft_cfg.placement.num_gpus_per_node
+        if self.sft_cfg.use_sequence_packing:
+            # With packing, batch_size is the *example* count (not bins) and the
+            # per-DP-rank bin count == bins_per_shard. The worker micro batch
+            # size refers to bin rows per micro-batch, derived from the
+            # ``max_tokens_per_microbatch`` token budget. We only require
+            # batch_size >= dp_size (every DP rank needs >= 1 bin) and do NOT
+            # require batch_size % micro_train_batch_size_per_gpu == 0, because
+            # micro_train_batch_size_per_gpu refers to bins-per-MB, not
+            # examples-per-MB; FFD rounds the bin count up to a multiple of
+            # dp_size, and bins/MB is a separate knob.
+            dp_size = self._dp_size()
+            if batch_size < dp_size:
+                raise ValueError(
+                    f"batch_size ({batch_size}) must be >= dp_size ({dp_size}) when "
+                    f"use_sequence_packing=True (each DP rank needs at least one bin)."
+                )
+            return
         if self.sft_cfg.strategy == "megatron":
             tp = self.sft_cfg.megatron_config.tensor_model_parallel_size
             pp = self.sft_cfg.megatron_config.pipeline_model_parallel_size
@@ -1358,6 +1426,24 @@ class SFTTrainer:
 
         logger.info("Dummy SFT training complete!")
 
+    @staticmethod
+    def _resolve_num_steps(
+        *,
+        num_steps: Optional[int],
+        num_epochs: int,
+        steps_per_epoch: int,
+        max_training_steps: Optional[int],
+    ) -> int:
+        """Resolve the total number of training steps.
+
+        Explicit ``num_steps`` takes precedence; otherwise it is derived from
+        ``num_epochs``. When ``max_training_steps`` is set it caps the result.
+        """
+        resolved = num_steps if num_steps is not None else num_epochs * steps_per_epoch
+        if max_training_steps is not None:
+            resolved = min(resolved, max_training_steps)
+        return resolved
+
     def train(self):
         """Full training loop: load data, iterate, log, checkpoint."""
         if self.sft_cfg.dummy_run_full_ctx:
@@ -1381,15 +1467,22 @@ class SFTTrainer:
         # steps_per_epoch is always derived from the data; callbacks rely on it.
         steps_per_epoch = max(1, ceil(len(tokenized) / batch_size))
 
-        # Resolve num_steps: explicit num_steps takes precedence; otherwise derive from num_epochs.
-        if self.sft_cfg.num_steps is not None:
-            num_steps = self.sft_cfg.num_steps
-        else:
-            num_steps = self.sft_cfg.num_epochs * steps_per_epoch
+        if self.sft_cfg.num_steps is None:
             logger.info(
                 f"num_steps not set; deriving from num_epochs={self.sft_cfg.num_epochs}: "
-                f"ceil({len(tokenized)} / {batch_size}) * {self.sft_cfg.num_epochs} = {num_steps} steps"
+                f"ceil({len(tokenized)} / {batch_size}) * {self.sft_cfg.num_epochs} = "
+                f"{self.sft_cfg.num_epochs * steps_per_epoch} steps"
             )
+
+        num_steps = self._resolve_num_steps(
+            num_steps=self.sft_cfg.num_steps,
+            num_epochs=self.sft_cfg.num_epochs,
+            steps_per_epoch=steps_per_epoch,
+            max_training_steps=self.sft_cfg.max_training_steps,
+        )
+
+        if self.sft_cfg.max_training_steps is not None:
+            logger.info(f"Capping training at max_training_steps={self.sft_cfg.max_training_steps}")
 
         # Early validation: dataset must have at least batch_size examples
         if len(tokenized) < batch_size:
@@ -1473,7 +1566,7 @@ class SFTTrainer:
                         batch_examples = tokenized[start_idx:] + tokenized[: end_idx - len(tokenized)]
                     else:
                         batch_examples = tokenized[start_idx:end_idx]
-                    batch = self.collate_batch(batch_examples, batch_size=batch_size)
+                    batch = self.collator(batch_examples, batch_size=batch_size)
 
                 self._fire("on_step_start", batch=batch)
 

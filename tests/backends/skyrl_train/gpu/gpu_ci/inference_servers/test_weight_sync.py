@@ -9,8 +9,13 @@ GPU CI tests for weight synchronization from trainer to inference server.
     - Trainer and server share GPU 0 (2 GPUs total, 1 shared)
     - Uses CUDA IPC handles for zero-copy weight transfer
 
+3. Legacy `WorkerWrap.load_weights` MoE reload, TP=1:
+    - Server on GPU 0 (1 GPU total, no separate trainer process)
+    - The NCCL or CUDA-IPC receiver is stubbed with safetensors-from-disk
+      to skip trainer-side sender setup
+
 Run:
-    uv run pytest tests/backends/skyrl_train/gpu/gpu_ci/inference_servers/test_weight_sync.py -v -s
+    uv run --extra dev --extra fsdp pytest tests/backends/skyrl_train/gpu/gpu_ci/inference_servers/test_weight_sync.py -v -s
 """
 
 import base64
@@ -28,7 +33,10 @@ from skyrl.backends.skyrl_train.inference_servers.common import (
     get_node_ip,
     get_open_port,
 )
-from skyrl.backends.skyrl_train.weight_sync import BroadcastInitInfo, CudaIpcInitInfo
+from skyrl.backends.skyrl_train.weight_sync import (
+    BroadcastInitInfo,
+    CudaIpcInitInfo,
+)
 from skyrl.train.config import SkyRLTrainConfig
 from tests.backends.skyrl_train.gpu.utils import InferenceEngineState
 

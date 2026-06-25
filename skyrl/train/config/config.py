@@ -39,9 +39,37 @@ class BaseConfig(ABC):
 
 
 @dataclass
+class DataLoaderConfig(BaseConfig):
+    num_workers: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Prompt DataLoader worker processes. Default of None auto-derives the value "
+                "(0 with the inference HTTP endpoint, else 8). Set 0 for in-process loading "
+                "that never respawns workers at epoch boundaries."
+            )
+        },
+    )
+    persistent_workers: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep DataLoader workers alive across epochs instead of respawning them at "
+                "every epoch boundary. Setting this requires `num_workers > 0`"
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if self.num_workers is not None and self.num_workers < 0:
+            raise ValueError(f"data.dataloader.num_workers must be None or >= 0, got {self.num_workers}.")
+
+
+@dataclass
 class DataConfig(BaseConfig):
     train_data: List[str] = field(default_factory=lambda: [os.path.expanduser("~/data/gsm8k/train.parquet")])
     val_data: List[str] = field(default_factory=lambda: [os.path.expanduser("~/data/gsm8k/validation.parquet")])
+    dataloader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +246,10 @@ class PlacementConfig(BaseConfig):
     colocate_all: bool = True
     """When True, training and inference share the same GPUs."""
     colocate_policy_ref: bool = True
+    """When colocate_all is False, True (default) still colocates policy and ref
+    on the same GPUs (one shared placement group). Set this item to False to place
+    policy and ref on separate GPUs (their own placement groups); needed when
+    a large model's policy and ref shards can't both fit on one GPU."""
     policy_num_nodes: int = 1
     policy_num_gpus_per_node: int = 1
     critic_num_nodes: int = 1
@@ -249,6 +281,15 @@ class PolicyConfig(BaseConfig):
     language_model_only: bool = False
     """When True, skip vision encoder initialization for multimodal models (e.g. Qwen3.5).
     Loads only the language model backbone using AutoModelForCausalLM."""
+    inference_only_init: bool = False
+    """When True, set up the policy worker for inference-only flows (forward + weight
+    sync, no train_step), skipping the training-only state that would otherwise OOM
+    memory-constrained nodes (e.g. large MoE on 4xH100). NOT valid for actual training.
+    Backend-specific behavior:
+    - FSDP: initialize weights in bf16 instead of fp32 (skipping the fp32 master weights
+      that mixed-precision training requires) and skip optimizer/LR-scheduler construction.
+    - Megatron: skip optimizer/LR-scheduler construction (DistributedOptimizer eagerly
+      materializes fp32 master + AdamW state on GPU)."""
 
 
 @dataclass
@@ -331,6 +372,22 @@ class CISPOConfig(BaseConfig):
     """Offset for upper bound of importance sampling ratio clipping (as opposed to PPO token update clipping)."""
 
 
+# DPPO parameters (only used when policy_loss_type="dppo")
+# See: https://arxiv.org/abs/2602.04879
+@dataclass
+class DPPOConfig(BaseConfig):
+    dppo_type: str = "binary_tv"
+    """DPPO divergence variant: ``"binary_tv"`` or ``"binary_kl"``. Used if ``policy_loss_type="dppo"``."""
+    delta_low: float = 0.2
+    """Divergence threshold for negative advantages (0.2 for TV, 0.05 for KL recommended)."""
+    delta_high: float = 0.2
+    """Divergence threshold for positive advantages (0.2 for TV, 0.05 for KL recommended)."""
+
+    def __post_init__(self):
+        if self.dppo_type not in ["binary_tv", "binary_kl"]:
+            raise ValueError("Invalid DPPO type")
+
+
 # see https://docs.skyrl.ai/docs/algorithms/off_policy_correction for more details
 @dataclass
 class OffPolicyCorrectionConfig(BaseConfig):
@@ -386,12 +443,17 @@ class AlgorithmConfig(BaseConfig):
     advantage_batch_normalize: bool = False
     value_head_prefix: str = "value_head"
     policy_loss_type: str = "regular"
-    """``"regular"``, ``"dual_clip"``, ``"gspo"``, ``"clip_cov"``, ``"kl_cov"``, or custom via ``PolicyLossRegistry``."""
+    """``"regular"``, ``"dual_clip"``, ``"gspo"``, ``"clip_cov"``, ``"kl_cov"``, ``cispo``, ``sapo``, ``"rollout_is"``, ``"dppo"``, or custom via ``PolicyLossRegistry``."""
     loss_reduction: str = "token_mean"
-    """``"token_mean"``, ``"sequence_mean"``, or ``"seq_mean_token_sum_norm"``. ``max_seq_len`` must be set explicitly for ``"seq_mean_token_sum_norm"``."""
+    """``"token_mean"``, ``"sequence_mean"``, ``"prompt_mean"``, or ``"seq_mean_token_sum_norm"``. ``max_seq_len`` must be set explicitly for ``"seq_mean_token_sum_norm"``."""
     grpo_norm_by_std: bool = True
     zero_variance_filter: bool = False
     """Loss-mask prompts with zero-variance rewards. Only applicable when rewards are response-level."""
+    zero_variance_filter_tol: float = 1e-6
+    """Two rewards within this absolute tolerance count as equal when detecting zero-variance groups.
+    Only used when ``zero_variance_filter=True``. Defaults to 1e-6 so float (LLM-judge) rewards that are
+    effectively identical are still treated as zero-variance; this is a no-op for integer rewards (e.g.
+    0/1) where the spread is either 0 or >= 1. Set to 0.0 for exact equality."""
     lambd: float = 1.0
     gamma: float = 1.0
     eps_clip_low: float = 0.2
@@ -412,6 +474,8 @@ class AlgorithmConfig(BaseConfig):
     """Only used when ``policy_loss_type="kl_cov"``."""
     cispo: CISPOConfig = field(default_factory=CISPOConfig)
     """Only used when ``policy_loss_type="cispo"``."""
+    dppo: DPPOConfig = field(default_factory=DPPOConfig)
+    """Only used when ``policy_loss_type="dppo"``."""
     max_seq_len: Optional[int] = None
     """Used for ``seq_mean_token_sum_norm`` loss reduction.
     Must be set explicitly for that reduction mode; otherwise can remain ``None``."""
@@ -427,12 +491,42 @@ class FullyAsyncConfig(BaseConfig):
     """Knobs for fully async training.
     See https://docs.skyrl.ai/docs/tutorials/fully_async#step-2-config-knobs-to-tune-for-fully-async-training."""
 
+    enabled: bool = False
+    """Indicates whether fully async training is enabled"""
     max_staleness_steps: int = 4
     """Maximum off-policy steps allowed. If a trajectory group is scheduled at step *i* and trained at step *j*,
     then ``j - i <= max_staleness_steps``. Larger values increase throughput but also off-policy-ness."""
     num_parallel_generation_workers: int = 768
     """Number of generation workers to spawn. Should be >= ``policy_mini_batch_size`` and
     <= ``policy_mini_batch_size * (max_staleness_steps + 1)``."""
+    sample_full_batch: bool = False
+    """Requires ``zero_variance_filter=True``. Drop zero-variance groups and keep pulling until the
+    mini-batch is full of non-zero-variance groups (async-native DAPO ``dynamic_sampling="filter"``).
+    Dropped groups are marked consumed (not regenerated on resume), so the per-epoch step count becomes
+    an upper bound: if the epoch's prompts run out mid mini-batch, the partial batch is discarded and
+    the epoch ends."""
+    clear_kv_cache_on_weight_sync: bool = False
+    """Whether or not to clear the KV cache on weight sync. Defaults to False.
+    If False, we reuse KV cache from stale policies during generation
+    (avoids recomputation at the cost of using slightly stale KV cache).
+    """
+
+    # --- Trainer simulation (no real trainer components) ---
+    simulate_training: bool = False
+    """If True, run fully-async generation with a SIMULATED trainer (see
+    ``FullyAsyncTrainerSim``): no policy/critic/ref models are instantiated and no weight
+    broadcast happens. Each step consumes a mini-batch from the generation buffer, sleeps for
+    ``simulate_training_step_seconds``, then issues pause/resume generation (as a real weight
+    sync would) but skips ``broadcast_to_inference_engines``. Used to benchmark the
+    generation/inference side (e.g. router load-balancing policies) on large models without
+    paying for trainer GPUs — typically pointed at already-served endpoints via
+    ``external_proxy_url`` / ``external_server_urls``. The generation-side dynamics (staleness
+    control, rate limiting, pause/resume) remain faithful."""
+    simulate_training_step_seconds: float = 30.0
+    """Wall-clock seconds the simulated dummy training step sleeps (stands in for fwd/bwd/optim)."""
+    simulate_weight_sync_seconds: float = 0.0
+    """Wall-clock seconds generation stays paused to stand in for the (skipped) weight broadcast.
+    0.0 = pause then immediately resume."""
 
 
 # ---------------------------------------------------------------------------
@@ -488,13 +582,20 @@ class InferenceEngineConfig(BaseConfig):
     enable_chunked_prefill: bool = True
     enable_return_routed_experts: bool = False
     max_num_batched_tokens: int = 8192
-    enforce_eager: bool = True
+    enforce_eager: bool = False
     """Disable CUDA graphs for stability. Set to ``False`` for higher performance,
     but this may affect convergence for long-running or long-context training jobs."""
     fully_sharded_loras: bool = False
     enable_ray_prometheus_stats: bool = True
     """Enable Ray Prometheus stats logger for inference engine metrics (vLLM v1 only)."""
     gpu_memory_utilization: float = 0.8
+    use_expandable_segments: bool = False
+    """Set ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` on the inference-engine
+    processes to reduce fragmentation. Independent of the trainer-side
+    ``TrainerConfig.use_expandable_segments``. Default ``False``: it is a safe opt-in
+    on vLLM >= 0.20.1, where the CuMemAllocator auto-disables expandable segments around
+    its sleep/wake memory pool. On older vLLM, sleep mode + expandable segments is a hard
+    error, so leave this off."""
     max_num_seqs: int = 1024
     remote_urls: List[str] = field(default_factory=lambda: [])
     enable_http_endpoint: bool = False
@@ -618,6 +719,11 @@ class EnvironmentConfig(BaseConfig):
 @dataclass
 class TrainerConfig(BaseConfig):
     placement: PlacementConfig = field(default_factory=PlacementConfig)
+    use_expandable_segments: bool = True
+    """Enable PyTorch's CUDA ``expandable_segments`` allocator on the training
+    workers to reduce GPU memory fragmentation across the offload/backload and
+    forward/backward cycles. See ``InferenceEngineConfig`` for the
+    equivalent inference-engine knob."""
     sequence_parallel_backend: str = "ulysses"
     strategy: str = "fsdp"
     policy: PolicyConfig = field(default_factory=PolicyConfig)
@@ -643,6 +749,9 @@ class TrainerConfig(BaseConfig):
     """Path for exported artifacts (HF models, debug dumps, etc.)."""
     bf16: bool = True
     epochs: int = 1
+    max_training_steps: Optional[int] = None
+    """If set, stop training after this many steps regardless of epochs or dataset size.
+    Useful for CI smoke tests and quick validation runs."""
     update_epochs_per_batch: int = 1
     """Number of gradient update passes over each training batch."""
     train_batch_size: int = 1024
@@ -651,8 +760,26 @@ class TrainerConfig(BaseConfig):
     critic_mini_batch_size: int = 256
     micro_train_batch_size_per_gpu: int = 1
     micro_forward_batch_size_per_gpu: int = 1
+    max_tokens_per_microbatch: int = -1
+    """Maximum number of tokens per microbatch for both forward and training steps. When > 0, microbatches 
+    are formed by bin-packing samples based on their token counts (from attention_mask) instead of using a 
+    fixed sample count, and micro_train_batch_size_per_gpu / micro_forward_batch_size_per_gpu are ignored.
+    -1 means disabled (use sample-based micro_train_batch_size_per_gpu / micro_forward_batch_size_per_gpu).
+    Applies to both forward and training micro-batching.
+
+    NOTE: this is a *soft* cap. Sequences are never split across microbatches, so a single sequence
+    longer than ``max_tokens_per_microbatch`` is placed alone in its own microbatch that exceeds the
+    cap (no error, no truncation). The true peak microbatch size is therefore
+    ``max(max_tokens_per_microbatch, longest_sequence_in_batch)``."""
+    recompute_old_logprobs_per_minibatch: bool = True
+    """When True, recomputes policy/ref model logprobs (and critic values) per mini-batch using
+    the same mini-batch + DP partition as the training step. When False, a single full-batch forward is run.
+    This makes the microbatch packing — and therefore the resulting logprobs/values — identical to
+    what forward_backward recomputes, so the PPO ratio (and critic value clipping) is exact at the
+    first inner step."""
     update_ref_every_epoch: bool = False
-    use_sample_packing: bool = True
+    remove_microbatch_padding: bool = True
+    """Pack samples into the THD layout and strip intra-microbatch padding (requires flash attention)."""
     eval_batch_size: int = 1024
     eval_before_train: bool = True
     eval_interval: int = 5
@@ -665,6 +792,8 @@ class TrainerConfig(BaseConfig):
     logger: str = "wandb"
     enable_ray_gpu_monitor: bool = True
     """Enable background Ray GPU/RAM metrics collection and logging to wandb."""
+    tags: Optional[List[str]] = None
+    """Optional list of tags to apply to the W&B run. Has no effect on other backends."""
     dump_data_batch: bool = False
     dump_eval_results: bool = True
     rope_scaling: Optional[Dict[str, Any]] = None
@@ -802,6 +931,15 @@ class SkyRLTrainConfig(BaseConfig):
         if self.trainer.algorithm.temperature is None:
             self.trainer.algorithm.temperature = self.generator.sampling_params.temperature
 
+        if self.data.dataloader.num_workers is None:
+            # TODO(Charlie): debug why inference http endpoint is slow when num_workers is 8
+            self.data.dataloader.num_workers = 0 if self.generator.inference_engine.enable_http_endpoint else 8
+        if self.data.dataloader.persistent_workers and self.data.dataloader.num_workers == 0:
+            raise ValueError(
+                "data.dataloader.persistent_workers requires num_workers > 0, but it was either"
+                " set explicitly to 0 or forced to 0 by the inference HTTP endpoint."
+            )
+
         # TODO(devpatel): Bandaid solution, replace this once we have a better
         # solution for LoRA performance degradation on the vLLM side
         from skyrl.backends.skyrl_train.inference_servers.utils import (
@@ -853,6 +991,27 @@ class SkyRLTrainConfig(BaseConfig):
                     "To add custom config fields, subclass the relevant config dataclass."
                 )
         overrides = OmegaConf.from_cli(args)
+        # Accept the deprecated ``trainer.use_sample_packing`` key as an alias
+        # for ``trainer.remove_microbatch_padding``. Remap it before
+        # construction so the strict key validation does not reject the old
+        # name.
+        if "trainer" in overrides and "use_sample_packing" in overrides.trainer:
+            if "remove_microbatch_padding" in overrides.trainer:
+                raise ValueError(
+                    "Specify only one of trainer.use_sample_packing (deprecated) and "
+                    "trainer.remove_microbatch_padding, not both."
+                )
+            import warnings
+
+            warnings.warn(
+                "trainer.use_sample_packing has been renamed to "
+                "trainer.remove_microbatch_padding; use "
+                "trainer.remove_microbatch_padding instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            overrides.trainer["remove_microbatch_padding"] = overrides.trainer["use_sample_packing"]
+            del overrides.trainer["use_sample_packing"]
         return cls.from_dict_config(overrides)
 
 

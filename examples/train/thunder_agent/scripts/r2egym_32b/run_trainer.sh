@@ -289,8 +289,10 @@ fi
   trainer.algorithm.use_kl_loss="$USE_KL_LOSS" \
   trainer.algorithm.kl_loss_coef="$KL_LOSS_COEF" \
   trainer.algorithm.max_seq_len="$TRAIN_MAX_SEQ_LEN" \
+  trainer.fully_async.enabled=true \
   trainer.fully_async.max_staleness_steps="$FULL_MAX_STALENESS_STEPS" \
   trainer.fully_async.num_parallel_generation_workers="$NUM_PARALLEL_GENERATION_WORKERS" \
+  trainer.fully_async.clear_kv_cache_on_weight_sync=false \
   trainer.placement.colocate_all=false \
   trainer.placement.colocate_policy_ref=true \
   trainer.placement.policy_num_nodes="$TRAIN_NUM_NODES" \
@@ -309,7 +311,7 @@ fi
   trainer.micro_train_batch_size_per_gpu="$MICRO_TRAIN_BATCH_SIZE_PER_GPU" \
   trainer.flash_attn=true \
   trainer.policy.record_memory=true \
-  trainer.use_sample_packing=false \
+  trainer.remove_microbatch_padding=false \
   trainer.ckpt_interval="$CKPT_INTERVAL" \
   trainer.hf_save_interval="$HF_SAVE_INTERVAL" \
   trainer.policy.optimizer_config.lr=1.0e-6 \

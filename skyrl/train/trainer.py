@@ -33,7 +33,11 @@ from skyrl.backends.skyrl_train.training_batch import (
 )
 from skyrl.backends.skyrl_train.utils import ppo_utils
 from skyrl.backends.skyrl_train.utils.io import io
+from skyrl.backends.skyrl_train.utils.off_policy_correction_utils import (
+    off_policy_correction_enabled,
+)
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
+    LOSSES_WITHOUT_OLD_LOGPROBS,
     AdaptiveKLController,
     FixedKLController,
     apply_loss_reduction_to_advantages_minibatch,
@@ -48,6 +52,7 @@ from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.dataset import PromptDataset
 from skyrl.train.dataset.preprocess import (
+    compute_prompt_boundaries,
     compute_prompt_mini_batch_boundaries,
     convert_prompts_responses_to_batch_tensors,
 )
@@ -83,6 +88,7 @@ from skyrl.train.utils.trainer_utils import (
     build_dataloader,
     cleanup_old_checkpoints,
     extract_step_from_path,
+    finalize_minibatch_rollout_logprob_diff_std,
     run_on_each_node,
     validate_consistency_for_latest_checkpoint,
     validate_generator_output,
@@ -194,6 +200,8 @@ class RayPPOTrainer:
         if self.train_dataset is not None:
             self.train_dataloader = build_dataloader(self.cfg, self.train_dataset, is_train=True)
             self.total_training_steps = len(self.train_dataloader) * self.cfg.trainer.epochs
+            if self.cfg.trainer.max_training_steps is not None:
+                self.total_training_steps = min(self.total_training_steps, self.cfg.trainer.max_training_steps)
 
     @torch.no_grad()
     async def eval(self) -> Dict[str, float]:
@@ -269,6 +277,7 @@ class RayPPOTrainer:
         # main training loop
         pbar = tqdm(total=self.total_training_steps, initial=self.global_step, desc="Training Batches Processed")
         self.global_step += 1  # start training at global_step 1
+        stop_training = False
 
         # booleans tracking whether we save ckpts
         # as well as hf model at step end
@@ -452,9 +461,20 @@ class RayPPOTrainer:
 
                 self.global_step += 1
 
+                if (
+                    self.cfg.trainer.max_training_steps is not None
+                    and self.global_step > self.cfg.trainer.max_training_steps
+                ):
+                    logger.info(f"Reached max_training_steps={self.cfg.trainer.max_training_steps}, stopping early.")
+                    stop_training = True
+                    break
+
                 del training_input, generator_output
 
             self._fire("on_epoch_end")
+
+            if stop_training:
+                break
 
         pbar.close()
         if self.colocate_all:
@@ -485,6 +505,25 @@ class RayPPOTrainer:
         self._fire("on_train_end")
         self.tracker.finish()
         logger.info("Training done!")
+
+    def flush_pending_metrics(self):
+        """Best-effort flush of metrics accumulated for the in-flight step.
+
+        Idempotent: the accumulators are cleared after the flush attempt, so a
+        second call is a no-op. Never raises.
+        """
+        if not self.all_metrics and not self.all_timings:
+            return
+        log_payload = {
+            **self.all_metrics,
+            **{f"timing/{k}": v for k, v in self.all_timings.items()},
+        }
+        try:
+            self.tracker.log(log_payload, step=self.global_step, commit=True)
+        except Exception as e:
+            logger.warning(f"Failed to flush pending metrics at step {self.global_step}: {e}")
+        self.all_metrics = {}
+        self.all_timings = {}
 
     def _remove_tail_data(self, entries: List[Any]) -> List[Any]:
         """Remove tail data to have even shards in terms of *effective* samples.
@@ -619,6 +658,12 @@ class RayPPOTrainer:
                     colocate_all=False,
                     sequence_parallel_size=cfg.trainer.ref.sequence_parallel_size,
                 )
+                if pg is not None:
+                    # The shared policy/ref placement group `pg` is set only when colocate_policy_ref is enabled
+                    logger.info(
+                        "Colocating policy and ref on the same GPUs across "
+                        f"{cfg.trainer.placement.policy_num_nodes} node(s)."
+                    )
             else:
                 ref_model = None
 
@@ -805,6 +850,9 @@ class RayPPOTrainer:
         training_input.metadata["policy_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
             uids, self.cfg.trainer.policy_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
         )
+        # Per-prompt boundaries (used by the `prompt_mean` loss reduction). Policy-only,
+        # since advantage normalization only applies to the policy.
+        training_input.metadata["policy_prompt_boundaries"] = compute_prompt_boundaries(uids)
         if self.cfg.trainer.critic.model.path is not None:
             training_input.metadata["critic_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
                 uids, self.cfg.trainer.critic_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
@@ -864,7 +912,11 @@ class RayPPOTrainer:
 
     @torch.no_grad()
     def postprocess_generator_output(
-        self, generator_output: GeneratorOutput, uids: List[str]
+        self,
+        generator_output: GeneratorOutput,
+        uids: List[str],
+        metrics_generator_output: Optional[GeneratorOutput] = None,
+        metrics_uids: Optional[List[str]] = None,
     ) -> Tuple[GeneratorOutput, List[str]]:
         """
         Converts to per token rewards and computes pass@N.
@@ -875,22 +927,29 @@ class RayPPOTrainer:
 
         In the future algorithm specific reward or loss mask post processing should be done here.
 
+        Reward metrics are computed over ``metrics_generator_output`` / ``metrics_uids`` when provided
+        (a superset of the trained output -- e.g. sample_full_batch passes the dropped groups so metrics
+        stay comparable), otherwise over ``generator_output`` / ``uids``. The per-token / loss-mask
+        conversion always applies to ``generator_output`` only.
+
         Returns:
             (generator_output, uids) — uids may be shorter than the input when merging.
         """
-        generator_output_for_metrics = generator_output
-        uids_for_metrics = uids
+        metrics_output = metrics_generator_output if metrics_generator_output is not None else generator_output
+        metrics_output_uids = metrics_uids if metrics_uids is not None else uids
+        generator_output_for_metrics = metrics_output
+        uids_for_metrics = metrics_output_uids
         if self.cfg.generator.step_wise_trajectories:
             generator_output_for_metrics = defaultdict(list)
-            for key in generator_output:
-                if isinstance(generator_output[key], list):
+            for key in metrics_output:
+                if isinstance(metrics_output[key], list):
                     generator_output_for_metrics[key] = [
-                        generator_output[key][i]
-                        for i in range(len(generator_output[key]))
-                        if generator_output["is_last_step"][i]
+                        metrics_output[key][i]
+                        for i in range(len(metrics_output[key]))
+                        if metrics_output["is_last_step"][i]
                     ]
             uids_for_metrics = [
-                uid for uid, is_last_step in zip(uids, generator_output["is_last_step"]) if is_last_step
+                uid for uid, is_last_step in zip(metrics_output_uids, metrics_output["is_last_step"]) if is_last_step
             ]
 
         # only use `generator_output_for_metrics` for metrics calculation
@@ -926,7 +985,17 @@ class RayPPOTrainer:
             per_token_rewards = rewards
         else:
             if self.cfg.trainer.algorithm.zero_variance_filter:
-                kept_indices_set = set(zero_variance_filter(rewards, uids))
+                kept_indices_set = set(
+                    zero_variance_filter(
+                        rewards,
+                        uids,
+                        loss_masks=generator_output["loss_masks"],
+                        tol=self.cfg.trainer.algorithm.zero_variance_filter_tol,
+                    )
+                )
+                num_groups = len(set(uids))
+                num_kept_groups = len({uids[i] for i in kept_indices_set})
+                self.all_metrics["reward/num_zero_variance_filtered"] = num_groups - num_kept_groups
                 generator_output["loss_masks"] = [
                     [0] * len(mask) if i not in kept_indices_set else mask
                     for i, mask in enumerate(generator_output["loss_masks"])
@@ -1081,6 +1150,56 @@ class RayPPOTrainer:
         data_save_dir.mkdir(parents=True, exist_ok=True)
         data.save(data_save_dir / f"{file_name}.pkl")
 
+    def _execute_forward_pass(
+        self,
+        model: str,
+        data_fwd_pass: TrainingInputBatch,
+        key: str,
+        mini_batch_boundaries: Optional[List[Tuple[int, int]]],
+    ) -> torch.Tensor:
+        """Executes forward pass that produces to produce the "old" logprobs/values.
+
+        With ``trainer.recompute_old_logprobs_per_minibatch`` set (and mini-batch boundaries
+        available), the forward is run per mini-batch — matching the mini-batch + DP partition
+        that the training step (``_execute_training_step`` / ``stage_data``) will use — so the
+        microbatch packing, and therefore the resulting logprobs/values, are identical to what
+        ``forward_backward`` recomputes. This makes the PPO ratio (and critic value clipping)
+        exact at the first inner step. Otherwise a single full-batch forward is run.
+
+        Per-sample outputs are concatenated in mini-batch order, which matches the global sample
+        order (mini-batches are contiguous and in order), so the result aligns with the full-batch
+        forward's ordering. Tensorizing the combined ``loss_fn_outputs`` once pads uniformly.
+        """
+        if self.cfg.trainer.recompute_old_logprobs_per_minibatch and mini_batch_boundaries:
+            # Pre-stage all per-DP mini-batch chunks once (same as the training step), so chunk
+            # serialization is amortized off the dispatch critical path across mini-batches. The
+            # staged chunks use the same partition as `_execute_training_step`'s `stage_data`, so
+            # the packing — and resulting logprobs/values — match what forward_backward recomputes.
+            all_chunk_refs = self.dispatch.stage_data(model, data_fwd_pass, mini_batch_boundaries)
+            combined_outputs: List[Dict[str, Any]] = []
+            for chunk_refs in all_chunk_refs:
+                mb_output = self.dispatch.forward_from_staged(model, chunk_refs)
+                combined_outputs.extend(mb_output.loss_fn_outputs)
+            return loss_fn_outputs_to_tensor(combined_outputs, key=key)
+
+        output = self.dispatch.forward(model, data_fwd_pass)
+        return loss_fn_outputs_to_tensor(output.loss_fn_outputs, key=key)
+
+    def _skip_policy_forward(self, training_input: TrainingInputBatch) -> bool:
+        """Whether the policy forward pass producing the "old" logprobs can be skipped.
+
+        Safe only when the loss optimizes against rollout logprobs and nothing else reads the
+        old logprobs: rollout logprobs are present (these losses fall back to old logprobs
+        without them), the KL reward penalty is off, and off-policy correction is disabled.
+        """
+        algorithm = self.cfg.trainer.algorithm
+        return (
+            algorithm.policy_loss_type in LOSSES_WITHOUT_OLD_LOGPROBS
+            and training_input.get("rollout_logprobs", None) is not None
+            and not algorithm.use_kl_in_reward
+            and not off_policy_correction_enabled(algorithm.off_policy_correction)
+        )
+
     @torch.no_grad()
     def fwd_logprobs_values_reward(
         self,
@@ -1116,18 +1235,32 @@ class RayPPOTrainer:
 
         # Critic forward (dispatch handles offload/backload automatically)
         if self.has_critic:
-            critic_output = self.dispatch.forward("critic", data_fwd_pass)
-            values = loss_fn_outputs_to_tensor(critic_output.loss_fn_outputs, key="values")
+            values = self._execute_forward_pass(
+                "critic",
+                data_fwd_pass,
+                key="values",
+                mini_batch_boundaries=training_input.metadata.get("critic_mini_batch_boundaries"),
+            )
 
-        # Ref forward
+        # Ref forward. The ref model is not trained, so there is no forward_backward to match
+        # its packing against -> always a single full-batch forward (boundaries=None).
         if self.ref_model is not None:
-            ref_output = self.dispatch.forward("ref", data_fwd_pass)
-            base_log_probs = loss_fn_outputs_to_tensor(ref_output.loss_fn_outputs, key="logprobs")
+            base_log_probs = self._execute_forward_pass(
+                "ref", data_fwd_pass, key="logprobs", mini_batch_boundaries=None
+            )
             self.dispatch.empty_cache("ref")
 
-        # Policy forward
-        policy_output = self.dispatch.forward("policy", data_fwd_pass)
-        action_log_probs = loss_fn_outputs_to_tensor(policy_output.loss_fn_outputs, key="logprobs")
+        # Policy forward. Skipped for losses that optimize against rollout logprobs (see
+        # `_skip_policy_forward`), where the resulting logprobs are never read.
+        if self._skip_policy_forward(training_input):
+            action_log_probs = None
+        else:
+            action_log_probs = self._execute_forward_pass(
+                "policy",
+                data_fwd_pass,
+                key="logprobs",
+                mini_batch_boundaries=training_input.metadata.get("policy_mini_batch_boundaries"),
+            )
 
         # Empty cache after all forward passes
         self.dispatch.empty_cache()
@@ -1135,16 +1268,16 @@ class RayPPOTrainer:
         sequences_all: torch.Tensor = training_input["sequences"]
         # NOTE (sumanthrh): The slicing is needed to make sure that the batch dimension doesn't change for the tensordict.
         base_log_probs = base_log_probs[: len(sequences_all)] if base_log_probs is not None else None
-        action_log_probs = action_log_probs[: len(sequences_all)]
+        action_log_probs = action_log_probs[: len(sequences_all)] if action_log_probs is not None else None
         values = values[: len(sequences_all)] if values is not None else None
 
         training_input["base_action_log_probs"] = base_log_probs
         training_input["action_log_probs"] = action_log_probs
         training_input["values"] = values
 
-        if training_input.get("rollout_logprobs", None) is not None:
-            # calculates the difference in probs between inference and trainer components
-            # only consider response tokens
+        if training_input.get("rollout_logprobs", None) is not None and action_log_probs is not None:
+            # Abs diff between rollout and forward-pass logprobs, over response tokens. When the
+            # forward pass is skipped, the worker's `minibatch_rollout_logprobs_abs_diff_*` is used.
             logprobs_diff = (
                 training_input["rollout_logprobs"][training_input["loss_mask"] > 0]
                 - action_log_probs[training_input["loss_mask"] > 0]
@@ -1226,6 +1359,7 @@ class RayPPOTrainer:
         self,
         data: TrainingInputBatch,
         mini_batch_boundaries: List[Tuple[int, int]],
+        prompt_boundaries: Optional[List[Tuple[int, int]]] = None,
     ) -> TrainingInputBatch:
         advantages = data["advantages"]
         response_mask = data["response_mask"]
@@ -1242,12 +1376,22 @@ class RayPPOTrainer:
         normalized_advantages = torch.zeros_like(advantages)
         for start_idx, end_idx in mini_batch_boundaries:
             mini_batch = data[start_idx:end_idx]
+            # For prompt_mean, select the prompt boundaries falling within this mini-batch
+            # and rebase them to mini-batch-relative indices.
+            mb_prompt_boundaries = None
+            if prompt_boundaries is not None:
+                mb_prompt_boundaries = [
+                    (p_start - start_idx, p_end - start_idx)
+                    for p_start, p_end in prompt_boundaries
+                    if start_idx <= p_start < end_idx
+                ]
             normalized_advantages[start_idx:end_idx] = apply_loss_reduction_to_advantages_minibatch(
                 advantages=mini_batch["advantages"],
                 loss_mask=mini_batch["loss_mask"],
                 loss_reduction=self.cfg.trainer.algorithm.loss_reduction,
                 micro_batch_size=self.cfg.trainer.micro_train_batch_size_per_gpu,
                 max_seq_len=self.cfg.trainer.algorithm.max_seq_len,
+                prompt_boundaries=mb_prompt_boundaries,
             )
 
         data["advantages"] = normalized_advantages
@@ -1274,7 +1418,8 @@ class RayPPOTrainer:
 
         if model == "policy":
             # Normalize advantages for policy training; critic training does not need this
-            data = self._normalize_advantages(data, boundaries)
+            prompt_boundaries = data.metadata.get("policy_prompt_boundaries")
+            data = self._normalize_advantages(data, boundaries, prompt_boundaries)
 
         all_metrics: Dict[str, List[float]] = defaultdict(list)
 
@@ -1296,6 +1441,7 @@ class RayPPOTrainer:
 
         # Reduce metrics across all mini-batches and epochs
         reduced_metrics = reduce_metrics(all_metrics, sum_loss_metrics=False)
+        finalize_minibatch_rollout_logprob_diff_std(reduced_metrics)
         return reduced_metrics
 
     def train_critic_and_policy(self, data: TrainingInputBatch):
